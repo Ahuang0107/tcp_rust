@@ -1,5 +1,17 @@
 # readme
 
+## TUN/TAP(https://www.kernel.org/doc/Documentation/networking/tuntap.txt)
+
+用空间户应用程序可以通过TUN/TAP直接从网络层或者数据链路层获取IP数据包或者以太帧
+
+```text
+3.2 Frame format:
+  If flag IFF_NO_PI is not set each frame format is: 
+     Flags [2 bytes]
+     Proto [2 bytes]
+     Raw protocol(IP, IPv6, etc) frame.
+```
+
 ## 用到的命令
 
 ### ip
