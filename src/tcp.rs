@@ -1,9 +1,15 @@
-use std::io::Write;
-
 #[allow(dead_code)]
 pub enum State {
-    SynRcvd,
-    Estab,
+    // Closed, 就是没有对应 TCB
+    // Listen, 也是没有对应 TCB 但是有存储所有处于监听状态的 port
+    SynReceived,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    LastAck,
+    TimeWait,
 }
 
 pub struct Connection {
@@ -13,22 +19,11 @@ pub struct Connection {
     pub send: SendSequenceSpace,
     /// 存储当前已接受的数据的状态
     pub recv: RecvSequenceSpace,
-    // pub ip: etherparse::Ipv4Header,
+    pub tcp: etherparse::TcpHeader,
+    pub ip: etherparse::Ipv4Header,
 }
 
 /// State of Send Sequence Space (RFC 793 S3.2 F4)
-///
-/// ```
-///      1         2          3          4
-/// ----------|----------|----------|----------
-///        SND.UNA    SND.NXT    SND.UNA
-///                             +SND.WND
-///
-/// 1 - old sequence numbers which have been acknowledged
-/// 2 - sequence numbers of unacknowledged data
-/// 3 - sequence numbers allowed for new data transmission
-/// 4 - future sequence numbers which are not yet allowed
-/// ```
 #[allow(dead_code)]
 pub struct SendSequenceSpace {
     /// send unacknowledged
@@ -48,17 +43,6 @@ pub struct SendSequenceSpace {
 }
 
 /// State of Receive Sequence Space (RFC 793 S3.2 F5)
-///
-/// ```
-///      1          2          3
-///  ----------|----------|----------
-///         RCV.NXT    RCV.NXT
-///                   +RCV.WND
-///
-/// 1 - old sequence numbers which have been acknowledged
-/// 2 - sequence numbers allowed for new reception
-/// 3 - future sequence numbers which are not yet allowed
-/// ```
 #[allow(dead_code)]
 pub struct RecvSequenceSpace {
     /// initial receive sequence number
@@ -75,97 +59,217 @@ pub struct RecvSequenceSpace {
 
 #[allow(dead_code)]
 impl Connection {
+    /// 接收到一个尝试连接的请求
+    /// 具体需要进行的操作见
+    /// rfc 793, page 65
     pub fn accept<'a>(
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
-        tcph: etherparse::TcpHeaderSlice<'a>,
+        seg: etherparse::TcpHeaderSlice<'a>,
         _data: &'a [u8],
     ) -> std::io::Result<Option<Self>> {
-        if !tcph.syn() {
-            // only expected SYN packet
+        // first check for an RST
+        if seg.rst() {
+            // An incoming RST should be ignored.  Return.
             return Ok(None);
         }
+        // second check for an ACK
+        if seg.ack() {
+            // Any acknowledgment is bad if it arrives on a connection still in
+            // the LISTEN state.  An acceptable reset segment should be formed
+            // for any arriving ACK-bearing segment.  The RST should be
+            // formatted as follows:
+            // <SEQ=SEG.ACK><CTL=RST>
+            // Return.
+            let mut tcp = etherparse::TcpHeader::new(
+                seg.destination_port(),
+                seg.source_port(),
+                seg.acknowledgment_number(),
+                1024,
+            );
+            tcp.rst = true;
+            let ip = etherparse::Ipv4Header::new(
+                0,
+                64,
+                etherparse::IpTrafficClass::Tcp,
+                iph.destination_addr().octets(),
+                iph.source_addr().octets(),
+            );
+            super::util::response(nic, &tcp, &ip)?;
+            return Ok(None);
+        }
+        // third check for a SYN
+        if seg.syn() {
+            // TODO: If the SYN bit is set, check the security
+            // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+            // TODO: select a iss
+            let iss = 0;
+            let wnd = 1024;
+            let mut c = Self {
+                state: State::SynReceived,
+                send: SendSequenceSpace {
+                    una: iss,
+                    nxt: iss,
+                    wnd,
+                    iss,
+                },
+                recv: RecvSequenceSpace {
+                    // rfc 793, page 66, line 6
+                    irs: seg.sequence_number(),
+                    // rfc 793, page 66, line 6
+                    nxt: seg.sequence_number() + 1,
+                    wnd: seg.window_size(),
+                },
+                tcp: etherparse::TcpHeader::new(
+                    seg.destination_port(),
+                    seg.source_port(),
+                    iss,
+                    wnd,
+                ),
+                ip: etherparse::Ipv4Header::new(
+                    0,
+                    64,
+                    etherparse::IpTrafficClass::Tcp,
+                    iph.destination_addr().octets(),
+                    iph.source_addr().octets(),
+                ),
+            };
+            // 接收到 SYN 需要用 SYN ACK 来响应
+            c.tcp.syn = true;
+            c.tcp.ack = true;
+            c.write(nic)?;
+            c.send.nxt = iss + 1;
+            // TODO: 应该还有一个补充默认socket的逻辑，所以创建 Connection 的逻辑也不应该在这里
+            return Ok(Some(c));
+        }
+        // TODO: 剩下的应该进行 discard 或者交给 ack processing 处理？
 
-        // 接收到 SYN，需要初始化一个 seq
-        let iss = 0;
-        let wnd = 1024;
-        let c = Self {
-            state: State::SynRcvd,
-            send: SendSequenceSpace {
-                una: iss,
-                nxt: iss,
-                wnd,
-                iss,
-            },
-            recv: RecvSequenceSpace {
-                irs: tcph.sequence_number(),
-                nxt: tcph.sequence_number() + 1,
-                wnd: tcph.window_size(),
-            },
-        };
-        let mut syn_ack = etherparse::TcpHeader::new(
-            tcph.destination_port(),
-            tcph.source_port(),
-            iss,
-            wnd,
-        );
-        // 接收到的 SYN 会有一个 seq，响应时需要将 ack 置为 seq+1
-        syn_ack.acknowledgment_number = c.recv.nxt;
-        // 接收到 SYN 需要用 SYN ACK 来响应
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        let ip = etherparse::Ipv4Header::new(
-            syn_ack.header_len(),
-            64,
-            etherparse::IpTrafficClass::Tcp,
-            iph.destination_addr().octets(),
-            iph.source_addr().octets(),
-        );
-        // prepare a buf to write package data we need to response
-        let mut buf = [0u8; 1500];
-        let mut buf_writer = &mut buf[..];
-        buf_writer.write(&[0, 0, 8, 0]).expect("");
-        ip.write(&mut buf_writer).expect("");
-        syn_ack.write(&mut buf_writer).expect("");
-        let unwritten_len = buf_writer.len();
-        let written_len = buf.len() - unwritten_len;
-        nic.send(&buf[..written_len])?;
-        Ok(Some(c))
+        Ok(None)
+    }
+    fn write(&mut self, nic: &mut tun_tap::Iface) -> std::io::Result<usize> {
+        let seq = self.send.nxt;
+        self.tcp.sequence_number = seq;
+        // 每次发送的响应的ack都是上一次接收到的请求的nxt
+        self.tcp.acknowledgment_number = self.recv.nxt;
+        self.ip
+            .set_payload_len(self.tcp.header_len() as usize)
+            .expect("payload length is not too big");
+
+        let payload_len = super::util::response(nic, &self.tcp, &self.ip)?;
+        let mut next_seq = seq.wrapping_add(self.tcp.header_len() as u32);
+        if self.tcp.syn {
+            next_seq = next_seq.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+        if wrapping_lt(self.send.nxt, next_seq) {
+            self.send.nxt = next_seq;
+        }
+        Ok(payload_len)
     }
     pub fn on_packet<'a>(
         &mut self,
+        nic: &mut tun_tap::Iface,
         _iph: etherparse::Ipv4HeaderSlice<'a>,
-        tcph: etherparse::TcpHeaderSlice<'a>,
+        seg: etherparse::TcpHeaderSlice<'a>,
         _data: &'a [u8],
     ) -> std::io::Result<()> {
-        // first, check that sequence numbers are valid (RFC 793 S3.3)
-        let ackn = tcph.acknowledgment_number();
-        if self.send.una < ackn {
-            if ackn <= self.send.nxt {
-                // not wrapping
-                // 正常情况，seq 没有套圈
-            } else if self.send.nxt < self.send.una {
-                // 正常情况，nxt已经套圈了
-            } else {
-                // 非正常情况
-                unimplemented!()
+        // rfc 793, page 69
+        // first check sequence number
+        if let State::SynReceived | State::Established = self.state {
+            if seg.window_size() == 0 {
+                // If an incoming segment is not acceptable, an acknowledgment
+                // should be sent in reply:
+                // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                self.recv.nxt = seg.sequence_number().wrapping_add(1);
+                super::util::response(nic, &self.tcp, &self.ip)?;
+                return Ok(());
             }
+        }
+
+        // second check the RST bis
+        if let State::SynReceived = self.state {
+            if seg.rst() {
+                // TODO: If the RST bit is set
+            }
+        }
+
+        // TODO: third check security and precedence
+
+        // TODO: fourth, check the SYN bit
+        if seg.syn() {}
+
+        // fifth check the ACK field
+        if seg.ack() {
+            // if the ACK bit is on
+            if let State::SynReceived = self.state {
+                // If SND.UNA =< SEG.ACK =< SND.NXT then enter ESTABLISHED state
+                // and continue processing
+                if is_between_wrapped(
+                    self.send.una.wrapping_sub(1),
+                    seg.acknowledgment_number(),
+                    self.send.nxt.wrapping_add(1),
+                ) {
+                    self.state = State::Established;
+                } else {
+                    // If the segment acknowledgment is not acceptable, form a reset segment
+                    // <SEQ=SEG.ACK><CTL=RST>
+                }
+            }
+            if let State::Established = self.state {}
         } else {
-            if ackn <= self.send.nxt && self.send.nxt < self.send.una {
-                // 正常情况，nxt已经套圈了，ackn也已经绕回去了
-            } else {
-                // 非正常情况
-                unimplemented!()
-            }
+            // if the ACK bit is off drop the segment and return
+            return Ok(());
         }
-        match self.state {
-            State::SynRcvd => {
-                // expect to get an ACK for our SYN
-                unimplemented!()
-            }
-            State::Estab => {
-                unimplemented!()
-            }
-        }
+
+        Ok(())
+    }
+}
+
+/// 判断 lhs 是否在 rhs 的左边
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    // From RFC1323:
+    //     TCP determines if a data segment is "old" or "new" by testing
+    //     whether its sequence number is within 2**31 bytes of the left edge
+    //     of the window, and if it is not, discarding the data as "old".  To
+    //     insure that new data is never mistakenly considered old and vice-
+    //     versa, the left edge of the sender's window has to be at most
+    //     2**31 away from the right edge of the receiver's window.
+    // wrapping_sub等说于如果 lhs < rhs，那么 lhs 会先加上 2^32+1 再计算
+    lhs.wrapping_sub(rhs) > (1 << 31)
+}
+
+/// (start,end)
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    wrapping_lt(start, x) && wrapping_lt(x, end)
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn test_is_between_wrapped() {
+        // ---------start---------------end-----------
+        //            5                  10
+        //        4
+        assert!(!super::is_between_wrapped(5, 4, 10));
+        // ---------start---------------end-----------
+        //            5                  10
+        //            5
+        assert!(!super::is_between_wrapped(5, 5, 10));
+        // ---------start---------------end-----------
+        //            5                  10
+        //                 6
+        assert!(super::is_between_wrapped(5, 6, 10));
+        // ---------start---------------end-----------
+        //            5                  10
+        //                             9
+        assert!(super::is_between_wrapped(5, 9, 10));
+        // ---------start---------------end-----------
+        //            5                  10
+        //                               10
+        assert!(!super::is_between_wrapped(5, 10, 10));
+        // ---------start---------------end-----------
+        //            5                  10
+        //                                  11
+        assert!(!super::is_between_wrapped(5, 11, 10));
     }
 }
