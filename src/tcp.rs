@@ -66,7 +66,7 @@ impl Connection {
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         seg: etherparse::TcpHeaderSlice<'a>,
-        _data: &'a [u8],
+        // _data: &'a [u8],
     ) -> std::io::Result<Option<Self>> {
         // first check for an RST
         if seg.rst() {
@@ -95,7 +95,7 @@ impl Connection {
                 iph.destination_addr().octets(),
                 iph.source_addr().octets(),
             );
-            super::util::response(nic, &tcp, &ip)?;
+            super::util::response(nic, &tcp, &ip, &[])?;
             return Ok(None);
         }
         // third check for a SYN
@@ -117,7 +117,7 @@ impl Connection {
                     // rfc 793, page 66, line 6
                     irs: seg.sequence_number(),
                     // rfc 793, page 66, line 6
-                    nxt: seg.sequence_number() + 1,
+                    nxt: seg.sequence_number().wrapping_add(1),
                     wnd: seg.window_size(),
                 },
                 tcp: etherparse::TcpHeader::new(
@@ -137,7 +137,7 @@ impl Connection {
             // 接收到 SYN 需要用 SYN ACK 来响应
             c.tcp.syn = true;
             c.tcp.ack = true;
-            c.write(nic)?;
+            c.write(nic, &[])?;
             c.send.nxt = iss + 1;
             // TODO: 应该还有一个补充默认socket的逻辑，所以创建 Connection 的逻辑也不应该在这里
             return Ok(Some(c));
@@ -146,32 +146,38 @@ impl Connection {
 
         Ok(None)
     }
-    fn write(&mut self, nic: &mut tun_tap::Iface) -> std::io::Result<usize> {
+    fn write(&mut self, nic: &mut tun_tap::Iface, data: &[u8]) -> std::io::Result<usize> {
         let seq = self.send.nxt;
         self.tcp.sequence_number = seq;
         // 每次发送的响应的ack都是上一次接收到的请求的nxt
         self.tcp.acknowledgment_number = self.recv.nxt;
+        // self.tcp
+        //     .set_options(&[etherparse::TcpOptionElement::MaximumSegmentSize(u16::MAX)])
+        //     .expect("TODO: panic message");
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &[])
+            .expect("unable to calc checksum");
         self.ip
-            .set_payload_len(self.tcp.header_len() as usize)
+            .set_payload_len(self.tcp.header_len() as usize + data.len())
             .expect("payload length is not too big");
 
-        let payload_len = super::util::response(nic, &self.tcp, &self.ip)?;
-        let mut next_seq = seq.wrapping_add(self.tcp.header_len() as u32);
+        super::util::response(nic, &self.tcp, &self.ip, data)?;
+        let mut len = data.len();
         if self.tcp.syn {
-            next_seq = next_seq.wrapping_add(1);
-            self.tcp.syn = false;
+            len += 1;
         }
-        if wrapping_lt(self.send.nxt, next_seq) {
-            self.send.nxt = next_seq;
+        if self.tcp.fin {
+            len += 1;
         }
-        Ok(payload_len)
+        Ok(len)
     }
     pub fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
         _iph: etherparse::Ipv4HeaderSlice<'a>,
         seg: etherparse::TcpHeaderSlice<'a>,
-        _data: &'a [u8],
+        data: &'a [u8],
     ) -> std::io::Result<()> {
         // rfc 793, page 69
         // first check sequence number
@@ -181,7 +187,7 @@ impl Connection {
                 // should be sent in reply:
                 // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
                 self.recv.nxt = seg.sequence_number().wrapping_add(1);
-                super::util::response(nic, &self.tcp, &self.ip)?;
+                super::util::response(nic, &self.tcp, &self.ip, data)?;
                 return Ok(());
             }
         }
@@ -215,10 +221,38 @@ impl Connection {
                     // <SEQ=SEG.ACK><CTL=RST>
                 }
             }
-            if let State::Established = self.state {}
+            if let State::Established = self.state {
+                // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK
+                if is_between_wrapped(
+                    self.send.una,
+                    seg.acknowledgment_number(),
+                    self.send.nxt.wrapping_add(1),
+                ) {
+                    self.send.una = seg.acknowledgment_number();
+                    // TODO: update send window
+                } else {
+                    // TODO: handle SEG.ACK < SND.UNA and SEG.ACK > SND.NXT
+                }
+            }
         } else {
             // if the ACK bit is off drop the segment and return
             return Ok(());
+        }
+
+        // TODO: sixth, check the URG bit
+
+        // seventh, process the segment text
+        if let State::Established | State::FinWait1 | State::FinWait2 = self.state {
+            // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            self.recv.nxt = seg.sequence_number().wrapping_add(1);
+            self.tcp = etherparse::TcpHeader::new(
+                seg.destination_port(),
+                seg.source_port(),
+                self.send.nxt,
+                self.send.wnd,
+            );
+            self.tcp.ack = true;
+            self.send.nxt += self.write(nic, data)? as u32;
         }
 
         Ok(())

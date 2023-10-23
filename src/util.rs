@@ -4,7 +4,8 @@ pub fn response(
     nic: &mut tun_tap::Iface,
     tcp: &etherparse::TcpHeader,
     ip: &etherparse::Ipv4Header,
-) -> std::io::Result<usize> {
+    data: &[u8],
+) -> std::io::Result<()> {
     let mut buf = [0u8; 1500];
     let buf_len = buf.len();
     let mut unwritten = &mut buf[..];
@@ -14,7 +15,9 @@ pub fn response(
     ip.write(&mut unwritten).expect("unable to write ip header");
     tcp.write(&mut unwritten)
         .expect("unable to write tcp header");
+    unwritten.write(data).expect("unable to write data");
     let written_len = buf_len - unwritten.len();
     nic.send(&buf[..written_len])?;
-    Ok(written_len)
+    println!("response with tcp header: {tcp:?}");
+    Ok(())
 }

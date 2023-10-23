@@ -27,10 +27,12 @@ fn main() -> std::io::Result<()> {
         // IFF_MULTI_QUEUE - Create a queue of multiqueue device
         let eth_flags = u16::from_be_bytes([buf[0], buf[1]]);
         let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
-        println!(
-            "received raw eth frame(flags: {eth_flags:x?},proto: {eth_proto:x?}): {:x?}",
-            &buf[..bytes_n]
-        );
+        if eth_flags == 800 {
+            println!(
+                "received raw eth frame(flags: {eth_flags:x?},proto: {eth_proto:x?}): {:x?}",
+                &buf[..bytes_n]
+            );
+        }
         if eth_proto != 0x0800 {
             // not ipv4
             continue;
@@ -49,22 +51,25 @@ fn main() -> std::io::Result<()> {
                         // (srcip, srcport, dstip, dstport)
                         let tcp_header_size = seg.slice().len();
                         let data_start_index = 4 + ip_header_size + tcp_header_size;
+                        let data = &buf[data_start_index..bytes_n];
+                        println!(
+                            "received packet: header: {:?}, data: {data:?}",
+                            seg.to_header()
+                        );
                         match connections.entry(Quad {
                             src: (src, seg.source_port()),
                             dst: (dst, seg.destination_port()),
                         }) {
-                            Entry::Occupied(_) => {
-                                unimplemented!()
+                            Entry::Occupied(mut e) => {
+                                e.get_mut().on_packet(&mut nic, iph, seg, data)?;
                             }
                             Entry::Vacant(e) => {
                                 // rfc 793, page 64
                                 if listening_ports.contains(&seg.destination_port()) {
                                     // If the state is LISTEN then
                                     if let Some(c) = tcp::Connection::accept(
-                                        &mut nic,
-                                        iph,
-                                        seg,
-                                        &buf[data_start_index..bytes_n],
+                                        &mut nic, iph, seg,
+                                        // &buf[data_start_index..bytes_n],
                                     )? {
                                         e.insert(c);
                                     }
@@ -101,7 +106,7 @@ fn main() -> std::io::Result<()> {
                                             iph.destination_addr().octets(),
                                             iph.source_addr().octets(),
                                         );
-                                        util::response(&mut nic, &tcp, &ip)?;
+                                        util::response(&mut nic, &tcp, &ip, &[])?;
                                     }
                                 }
                             }
