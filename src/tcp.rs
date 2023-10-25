@@ -138,7 +138,6 @@ impl Connection {
             c.tcp.syn = true;
             c.tcp.ack = true;
             c.write(nic, &[])?;
-            c.send.nxt = iss + 1;
             // TODO: 应该还有一个补充默认socket的逻辑，所以创建 Connection 的逻辑也不应该在这里
             return Ok(Some(c));
         }
@@ -146,7 +145,7 @@ impl Connection {
 
         Ok(None)
     }
-    fn write(&mut self, nic: &mut tun_tap::Iface, data: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, nic: &mut tun_tap::Iface, data: &[u8]) -> std::io::Result<()> {
         let seq = self.send.nxt;
         self.tcp.sequence_number = seq;
         // 每次发送的响应的ack都是上一次接收到的请求的nxt
@@ -170,7 +169,8 @@ impl Connection {
         if self.tcp.fin {
             len += 1;
         }
-        Ok(len)
+        self.send.nxt += len as u32;
+        Ok(())
     }
     pub fn on_packet<'a>(
         &mut self,
@@ -252,7 +252,7 @@ impl Connection {
                 self.send.wnd,
             );
             self.tcp.ack = true;
-            self.send.nxt += self.write(nic, data)? as u32;
+            self.write(nic, data)?;
         }
 
         Ok(())
